@@ -1,0 +1,324 @@
+name: Build EclipsClipGuard
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Write project files
+        run: |
+          mkdir -p _clipguard/src/main/java/ru/eclips/clipguard
+          mkdir -p _clipguard/src/main/resources
+
+          cat > _clipguard/pom.xml <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>ru.eclips</groupId>
+              <artifactId>EclipsClipGuard</artifactId>
+              <version>1.0.0</version>
+              <packaging>jar</packaging>
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+              <repositories>
+                  <repository>
+                      <id>lanink</id>
+                      <url>https://repo.lanink.cn/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+              <dependencies>
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>MOT-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+              <build>
+                  <finalName>EclipsClipGuard</finalName>
+                  <plugins>
+                      <plugin>
+                          <groupId>org.apache.maven.plugins</groupId>
+                          <artifactId>maven-compiler-plugin</artifactId>
+                          <version>3.11.0</version>
+                          <configuration>
+                              <release>17</release>
+                              <encoding>UTF-8</encoding>
+                          </configuration>
+                      </plugin>
+                  </plugins>
+              </build>
+          </project>
+          EOF
+
+          cat > _clipguard/src/main/resources/plugin.yml <<'EOF'
+          name: EclipsClipGuard
+          main: ru.eclips.clipguard.EclipsClipGuard
+          version: "1.0.0"
+          api: ["1.0.0"]
+          author: Eclips
+          description: "Защита в креативе: нельзя применять, брать и держать клипсы (EclipsClipItems), нельзя ставить золотой блок"
+          softdepend: [EclipsGuard, EclipsClipItems, EclipsClips]
+          EOF
+
+          cat > _clipguard/src/main/java/ru/eclips/clipguard/EclipsClipGuard.java <<'EOF'
+          package ru.eclips.clipguard;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.block.Block;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.block.BlockPlaceEvent;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.inventory.InventoryPickupItemEvent;
+          import cn.nukkit.event.inventory.InventoryTransactionEvent;
+          import cn.nukkit.event.player.PlayerInteractEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.inventory.Inventory;
+          import cn.nukkit.inventory.PlayerInventory;
+          import cn.nukkit.inventory.transaction.InventoryTransaction;
+          import cn.nukkit.inventory.transaction.action.InventoryAction;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.plugin.PluginBase;
+
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.UUID;
+
+          /**
+           * EclipsClipGuard 1.0.0
+           * - в креативе нельзя применить клипсы (событие отменяется, а предмет на момент
+           *   обработки EclipsClipItems убирается из руки, поэтому баланс не растёт);
+           * - клипсы нельзя взять в инвентарь в креативе (меню креатива, подбор с земли);
+           * - раз в 3 тика все 6 видов клипсов удаляются из инвентаря игроков в креативе;
+           * - в креативе нельзя ставить золотой блок (на нём работает плагин регионов).
+           */
+          public class EclipsClipGuard extends PluginBase implements Listener {
+
+              private static final String CLIP_CLASS_PREFIX = "ru.eclips.clipitems.ClipItem";
+              private static final String CLIP_NAME_PART = "клипсов";
+              private static final int CLEAN_PERIOD_TICKS = 3;
+              /** Задержка перед первой чисткой после входа в креатив: EclipsGuard успевает сохранить настоящий инвентарь. */
+              private static final int GRACE_TICKS = 20;
+
+              private static final String MSG_USE = "§c[Eclips] В креативе нельзя использовать клипсы!";
+              private static final String MSG_TAKE = "§c[Eclips] В креативе нельзя брать клипсы!";
+              private static final String MSG_GOLD = "§c[Eclips] В креативе нельзя ставить золотые блоки!";
+          private static final String MSG_REMOVED = "§c[Eclips] В креативе клипсы запрещены, они удалены из инвентаря.";
+
+              private final Map<UUID, Item> swapped = new HashMap<>();
+              private final Map<UUID, Integer> creativeTicks = new HashMap<>();
+              private final Map<UUID, Long> msgCooldown = new HashMap<>();
+
+              @Override
+              public void onEnable() {
+                  getServer().getPluginManager().registerEvents(this, this);
+                  getServer().getScheduler().scheduleRepeatingTask(this, this::cleanTick, CLEAN_PERIOD_TICKS);
+                  getLogger().info("EclipsClipGuard 1.0.0 enabled: clean every " + CLEAN_PERIOD_TICKS + " ticks");
+              }
+
+              private static boolean isCreative(Player p) {
+                  return p != null && p.getGamemode() == 1;
+              }
+
+              private static boolean isClip(Item item) {
+                  if (item == null || item.isNull()) {
+                      return false;
+                  }
+                  if (item.getClass().getName().startsWith(CLIP_CLASS_PREFIX)) {
+                      return true;
+                  }
+                  String name = item.getName();
+                  return name != null && name.contains(CLIP_NAME_PART);
+              }
+
+              private void warn(Player p, String msg) {
+                  long now = System.currentTimeMillis();
+                  Long last = msgCooldown.get(p.getUniqueId());
+                  if (last != null && now - last < 2000L) {
+                      return;
+                  }
+                  msgCooldown.put(p.getUniqueId(), now);
+                  p.sendMessage(msg);
+              }
+
+              /** Попытка применить клипсы: отменяем и "перехватываем" до EclipsClipItems (он работает на NORMAL). */
+              @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = false)
+              public void onUseFirst(PlayerInteractEvent e) {
+                  Player p = e.getPlayer();
+                  if (!isCreative(p)) {
+                      return;
+                  }
+                  PlayerInventory inv = p.getInventory();
+                  Item hand = inv.getItemInHand();
+                  if (!isClip(e.getItem()) && !isClip(hand)) {
+                      return;
+                  }
+                  e.setCancelled(true);
+                  warn(p, MSG_USE);
+                  if (isClip(hand)) {
+                      // EclipsClipItems начисляет клипсы только если клипсы в руке: убираем на время обработки события
+                      swapped.put(p.getUniqueId(), hand);
+                      inv.setItemInHand(Item.get(0));
+                      getServer().getScheduler().scheduleDelayedTask(this, () -> restore(p), 1);
+                  }
+              }
+
+              /** Когда все остальные обработчики отработали, возвращаем предмет (удалит его чистка). */
+              @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = false)
+              public void onUseLast(PlayerInteractEvent e) {
+                  restore(e.getPlayer());
+              }
+
+              private void restore(Player p) {
+                  if (p == null) {
+                      return;
+                  }
+                  Item saved = swapped.remove(p.getUniqueId());
+                  if (saved == null || !p.isOnline()) {
+                      return;
+                  }
+                  PlayerInventory inv = p.getInventory();
+                  if (inv.getItemInHand().isNull()) {
+                      inv.setItemInHand(saved);
+                  }
+              }
+
+              /** Меню креатива и любые перекладывания клипсов в креативе. */
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = false)
+              public void onTransaction(InventoryTransactionEvent e) {
+                  InventoryTransaction tr = e.getTransaction();
+                  Player p = tr.getSource();
+                  if (!isCreative(p)) {
+                      return;
+                  }
+                  for (InventoryAction a : tr.getActions()) {
+                      if (isClip(a.getSourceItem()) || isClip(a.getTargetItem())) {
+                          e.setCancelled(true);
+                          warn(p, MSG_TAKE);
+                          return;
+                      }
+                  }
+              }
+
+              /** Подбор клипсов с земли в креативе. */
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = false)
+              public void onPickup(InventoryPickupItemEvent e) {
+                  Inventory inv = e.getInventory();
+                  if (inv == null || !(inv.getHolder() instanceof Player)) {
+                      return;
+                  }
+                  Player p = (Player) inv.getHolder();
+                  if (!isCreative(p)) {
+                      return;
+                  }
+                  if (isClip(e.getItem().getItem())) {
+                      e.setCancelled(true);
+                  }
+              }
+
+              /** Золотой блок в креативе: на нём работает плагин регионов, чтобы не было багов. */
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = false)
+              public void onPlace(BlockPlaceEvent e) {
+                  Player p = e.getPlayer();
+                  if (!isCreative(p)) {
+                      return;
+                  }
+                  Block b = e.getBlock();
+                  if (b == null) {
+                      return;
+                  }
+                  if (b.getId() == 41 || b.getClass().getSimpleName().equalsIgnoreCase("BlockGold")) {
+                      e.setCancelled(true);
+                      warn(p, MSG_GOLD);
+                  }
+              }
+
+              @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = false)
+              public void onQuit(PlayerQuitEvent e) {
+                  Player p = e.getPlayer();
+                  UUID id = p.getUniqueId();
+                  Item saved = swapped.remove(id);
+                  if (saved != null && p.getInventory().getItemInHand().isNull()) {
+                      p.getInventory().setItemInHand(saved);
+                  }
+                  creativeTicks.remove(id);
+                  msgCooldown.remove(id);
+              }
+
+              /** Каждые 3 тика: удаляем все клипсы из инвентаря игроков в креативе. */
+              private void cleanTick() {
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      UUID id = p.getUniqueId();
+                      if (!isCreative(p)) {
+                          creativeTicks.remove(id);
+                          continue;
+                      }
+                      int t = creativeTicks.merge(id, CLEAN_PERIOD_TICKS, Integer::sum);
+                      if (t < GRACE_TICKS) {
+                          continue;
+                      }
+                      if (strip(p) > 0) {
+                          warn(p, MSG_REMOVED);
+                      }
+                  }
+              }
+
+              private int strip(Player p) {
+                  int removed = 0;
+                  PlayerInventory inv = p.getInventory();
+
+                  List<Integer> slots = new ArrayList<>();
+                  for (Map.Entry<Integer, Item> en : inv.getContents().entrySet()) {
+                      if (isClip(en.getValue())) {
+                          slots.add(en.getKey());
+                      }
+                  }
+                  for (Integer slot : slots) {
+                      inv.setItem(slot, Item.get(0));
+                      removed++;
+                  }
+
+                  try {
+                      if (isClip(p.getOffhandInventory().getItem(0))) {
+                          p.getOffhandInventory().setItem(0, Item.get(0));
+                          removed++;
+                      }
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      if (isClip(p.getCursorInventory().getItem(0))) {
+                          p.getCursorInventory().setItem(0, Item.get(0));
+                          removed++;
+                      }
+                  } catch (Throwable ignored) {
+                  }
+                  return removed;
+              }
+          }
+          EOF
+
+      - name: Build with Maven
+        run: mvn -B -f _clipguard/pom.xml clean package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: EclipsClipGuard
+          path: _clipguard/target/EclipsClipGuard.jar
